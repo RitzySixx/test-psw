@@ -9,6 +9,126 @@
 # ============================================================
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing
 
+# Add WinAPI types for signature checking
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public class WinTrust
+{
+    public const int WTD_UI_NONE = 2;
+    public const int WTD_REVOKE_NONE = 0;
+    public const int WTD_CHOICE_FILE = 1;
+    public const int WTD_STATEACTION_IGNORE = 0;
+    
+    public const uint GENERIC_VERIFY_V2 = 0x00000200;
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINTRUST_FILE_INFO
+    {
+        public uint cbStruct;
+        public IntPtr pcwszFilePath;
+        public IntPtr hFile;
+        public IntPtr pgKnownSubject;
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINTRUST_DATA
+    {
+        public uint cbStruct;
+        public IntPtr pPolicyCallbackData;
+        public IntPtr pSIPClientData;
+        public uint dwUIChoice;
+        public uint fdwRevocationChecks;
+        public uint dwUnionChoice;
+        public IntPtr pFile;
+        public uint dwStateAction;
+        public IntPtr hWVTStateData;
+        public IntPtr pwszURLReference;
+        public uint dwProvFlags;
+        public uint dwUIContext;
+    }
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern uint WinVerifyTrust(
+        IntPtr hwnd,
+        ref Guid pgActionID,
+        ref WINTRUST_DATA pWVTData
+    );
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile
+    );
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern bool CryptCATAdminAcquireContext2(
+        ref IntPtr phCatAdmin,
+        ref IntPtr pgSubsystem,
+        string pwszHashAlgorithm,
+        IntPtr pStrongHashPolicy,
+        uint dwFlags
+    );
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern bool CryptCATAdminReleaseContext(
+        IntPtr hCatAdmin,
+        uint dwFlags
+    );
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern bool CryptCATAdminCalcHashFromFileHandle2(
+        IntPtr hCatAdmin,
+        IntPtr hFile,
+        ref uint pcbHash,
+        byte[] pbHash,
+        uint dwFlags
+    );
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern IntPtr CryptCATAdminEnumCatalogFromHash(
+        IntPtr hCatAdmin,
+        byte[] pbHash,
+        uint cbHash,
+        uint dwFlags,
+        ref IntPtr phPrevCatInfo
+    );
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern bool CryptCATCatalogInfoFromContext(
+        IntPtr hCatInfo,
+        IntPtr psCatalogInfo,
+        uint dwFlags
+    );
+    
+    [DllImport("wintrust.dll", SetLastError = true)]
+    public static extern bool CryptCATAdminReleaseCatalogContext(
+        IntPtr hCatAdmin,
+        IntPtr hCatInfo,
+        uint dwFlags
+    );
+}
+
+public class Win32API
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern int QueryDosDevice(
+        string lpDeviceName,
+        System.Text.StringBuilder lpTargetPath,
+        int ucchMax
+    );
+}
+'@ -Namespace System
+
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -385,6 +505,340 @@ $script:filteredEvents = @()
 $script:currentTab = "All"
 
 # ============================================================
+#  DRIVE MAPPING (HarddiskVolume to Drive Letter)
+# ============================================================
+$script:driveMap = $null
+
+function Initialize-DriveMap {
+    if ($script:driveMap) { return }
+    
+    $script:driveMap = @{}
+    
+    try {
+        # Query all DOS device mappings
+        $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable' }
+        
+        foreach ($drive in $drives) {
+            $driveLetter = $drive.Name.TrimEnd('\')
+            
+            # Use QueryDosDevice to get the NT device path
+            $target = New-Object System.Text.StringBuilder 256
+            $result = [Win32API]::QueryDosDevice($driveLetter.Substring(0, 2), $target, 256)
+            
+            if ($result -gt 0) {
+                $ntPath = $target.ToString()
+                # Map both formats
+                $script:driveMap[$ntPath] = $driveLetter
+                
+                # Also map common variations
+                if ($ntPath -match '\\Device\\HarddiskVolume(\d+)') {
+                    $volNum = $matches[1]
+                    $script:driveMap["\Device\HarddiskVolume$volNum"] = $driveLetter
+                    $script:driveMap["\\?\Device\HarddiskVolume$volNum"] = $driveLetter
+                    $script:driveMap["Device\HarddiskVolume$volNum"] = $driveLetter
+                    $script:driveMap["HarddiskVolume$volNum"] = $driveLetter
+                }
+            }
+        }
+        
+        # Manual fallback for common drives if QueryDosDevice fails
+        if ($script:driveMap.Count -eq 0) {
+            $driveLetters = @('C', 'D', 'E') | Where-Object { Test-Path "${_}:\" }
+            $volNum = 1
+            foreach ($letter in $driveLetters) {
+                $script:driveMap["\Device\HarddiskVolume$volNum"] = "${letter}:"
+                $script:driveMap["\\?\Device\HarddiskVolume$volNum"] = "${letter}:"
+                $script:driveMap["Device\HarddiskVolume$volNum"] = "${letter}:"
+                $script:driveMap["HarddiskVolume$volNum"] = "${letter}:"
+                $volNum++
+            }
+        }
+    } catch {
+        # Fallback to simple mapping
+        $volNum = 1
+        foreach ($drive in @('C', 'D', 'E')) {
+            if (Test-Path "${drive}:\") {
+                $script:driveMap["\Device\HarddiskVolume$volNum"] = "${drive}:"
+                $script:driveMap["HarddiskVolume$volNum"] = "${drive}:"
+                $volNum++
+            }
+        }
+    }
+}
+
+# ============================================================
+#  CONVERT HARDDISKVOLUME TO DRIVE LETTER
+# ============================================================
+function Convert-HarddiskVolumeToDrive {
+    param([string]$Path)
+    
+    if ([string]::IsNullOrEmpty($Path)) { return $Path }
+    
+    # If already has drive letter, return as-is
+    if ($Path -match '^[A-Za-z]:\\') { return $Path }
+    
+    Initialize-DriveMap
+    
+    # Patterns to match HarddiskVolume paths (exactly like Python version)
+    $patterns = @(
+        '(\\\\\?\\|\\\\)?Device\\HarddiskVolume(\d+)(\\.*)',
+        'Device\\HarddiskVolume(\d+)(\\.*)',
+        'HarddiskVolume(\d+)(\\.*)'
+    )
+    
+    foreach ($pattern in $patterns) {
+        if ($Path -match $pattern) {
+            $volumeNumber = if ($matches.Count -ge 3) { $matches[2] } else { $matches[1] }
+            $remainingPath = if ($matches.Count -ge 3) { $matches[3] } else { $matches[2] }
+            if (-not $remainingPath) { $remainingPath = "" }
+            
+            # Try all possible device path variations
+            $possiblePaths = @(
+                "\Device\HarddiskVolume$volumeNumber",
+                "\\?\Device\HarddiskVolume$volumeNumber",
+                "Device\HarddiskVolume$volumeNumber",
+                "HarddiskVolume$volumeNumber"
+            )
+            
+            foreach ($devicePath in $possiblePaths) {
+                if ($script:driveMap.ContainsKey($devicePath)) {
+                    $driveLetter = $script:driveMap[$devicePath]
+                    $converted = "$driveLetter\$($remainingPath.TrimStart('\'))"
+                    return $converted
+                }
+            }
+            
+            # Try direct lookup in registry as last resort
+            try {
+                $mountedDevices = Get-ItemProperty -Path "HKLM:\SYSTEM\MountedDevices" -ErrorAction SilentlyContinue
+                foreach ($prop in $mountedDevices.PSObject.Properties) {
+                    if ($prop.Name -like "*HarddiskVolume$volumeNumber*") {
+                        $dosDevice = $prop.Name -replace '\\DosDevices\\', ''
+                        if ($dosDevice -match '^[A-Za-z]:') {
+                            $driveLetter = $dosDevice
+                            $converted = "$driveLetter\$($remainingPath.TrimStart('\'))"
+                            return $converted
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+    
+    return $Path
+}
+
+# ============================================================
+#  CHECK CATALOG SIGNATURE (CryptCATAdmin API)
+# ============================================================
+function Test-CatalogSignatureWin32 {
+    param([string]$FilePath)
+    
+    try {
+        # Open file with GENERIC_READ (0x80000000), FILE_SHARE_READ (1), OPEN_EXISTING (3)
+        $fileHandle = [WinTrust]::CreateFileW(
+            $FilePath,
+            0x80000000,
+            1,
+            [IntPtr]::Zero,
+            3,
+            0,
+            [IntPtr]::Zero
+        )
+        
+        if ($fileHandle -eq [IntPtr]::Zero -or $fileHandle -eq -1) {
+            return $false
+        }
+        
+        try {
+            $hCatAdmin = [IntPtr]::Zero
+            $nullRef = [IntPtr]::Zero
+            
+            # Acquire catalog admin context
+            if ([WinTrust]::CryptCATAdminAcquireContext2([ref]$hCatAdmin, [ref]$nullRef, $null, [IntPtr]::Zero, 0)) {
+                try {
+                    # Calculate hash
+                    $hashSize = 100
+                    $hashBuffer = New-Object byte[] $hashSize
+                    $hashSizeRef = [ref][uint]$hashSize
+                    
+                    if ([WinTrust]::CryptCATAdminCalcHashFromFileHandle2($hCatAdmin, $fileHandle, $hashSizeRef, $hashBuffer, 0)) {
+                        $actualHashSize = $hashSizeRef.Value
+                        if ($actualHashSize -lt $hashSize) {
+                            $hashBuffer = $hashBuffer[0..($actualHashSize-1)]
+                        }
+                        
+                        $hPrevCat = [IntPtr]::Zero
+                        $hCatInfo = [WinTrust]::CryptCATAdminEnumCatalogFromHash($hCatAdmin, $hashBuffer, $actualHashSize, 0, [ref]$hPrevCat)
+                        
+                        if ($hCatInfo -ne [IntPtr]::Zero) {
+                            try {
+                                # Allocate structure for catalog info
+                                $catalogInfoSize = 1024
+                                $catalogInfoPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($catalogInfoSize)
+                                try {
+                                    # Zero out structure
+                                    for ($i = 0; $i -lt $catalogInfoSize; $i++) {
+                                        [System.Runtime.InteropServices.Marshal]::WriteByte($catalogInfoPtr, $i, 0)
+                                    }
+                                    
+                                    # Write structure size at beginning
+                                    [System.Runtime.InteropServices.Marshal]::WriteInt32($catalogInfoPtr, 1024)
+                                    
+                                    if ([WinTrust]::CryptCATCatalogInfoFromContext($hCatInfo, $catalogInfoPtr, 0)) {
+                                        return $true
+                                    }
+                                } finally {
+                                    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($catalogInfoPtr)
+                                }
+                            } finally {
+                                [WinTrust]::CryptCATAdminReleaseCatalogContext($hCatAdmin, $hCatInfo, 0)
+                            }
+                        }
+                    }
+                } finally {
+                    [WinTrust]::CryptCATAdminReleaseContext($hCatAdmin, 0)
+                }
+            }
+        } finally {
+            [WinTrust]::CloseHandle($fileHandle)
+        }
+    } catch {
+        # Silently continue
+    }
+    
+    return $false
+}
+
+# ============================================================
+#  ULTIMATE SIGNATURE CHECKER (Python-style WinTrust API)
+# ============================================================
+function Get-Signature {
+    param([string]$FilePath)
+
+    # Handle null/empty paths
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or $FilePath -in @('Unknown','N/A','<no path>','')) {
+        return @{ 
+            Status = 'N/A'
+            Color = '#FF555555'
+            Detail = ''
+        }
+    }
+    
+    # Clean path
+    $clean = $FilePath.Trim().Trim('"').Trim("'")
+    
+    # Convert HarddiskVolume paths to drive letters (exactly like Python)
+    $clean = Convert-HarddiskVolumeToDrive -Path $clean
+    
+    # Extract just the path if there are arguments
+    if ($clean -match '^([A-Za-z]:\\[^"*?<>|]+?\.[a-zA-Z0-9]{1,6})') {
+        $clean = $matches[1]
+    }
+    
+    # Check if file exists (Python returns "deleted")
+    if (-not (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue)) {
+        return @{ 
+            Status = 'deleted'
+            Color = '#FFCC3333'
+            Detail = "File not found on disk: $clean"
+        }
+    }
+    
+    # Check if it's a directory (Python returns "unsigned")
+    if (Test-Path -LiteralPath $clean -PathType Container) {
+        return @{ 
+            Status = 'unsigned'
+            Color = '#FFF39C12'
+            Detail = 'Path is a directory'
+        }
+    }
+    
+    try {
+        # ===== PART 1: WinVerifyTrust Direct API Call (matches Python) =====
+        $filePathPtr = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($clean)
+        
+        try {
+            $fileInfo = New-Object WinTrust+WINTRUST_FILE_INFO
+            $fileInfo.cbStruct = [System.Runtime.InteropServices.Marshal]::SizeOf($fileInfo)
+            $fileInfo.pcwszFilePath = $filePathPtr
+            $fileInfo.hFile = [IntPtr]::Zero
+            $fileInfo.pgKnownSubject = [IntPtr]::Zero
+            
+            $data = New-Object WinTrust+WINTRUST_DATA
+            $data.cbStruct = [System.Runtime.InteropServices.Marshal]::SizeOf($data)
+            $data.pPolicyCallbackData = [IntPtr]::Zero
+            $data.pSIPClientData = [IntPtr]::Zero
+            $data.dwUIChoice = [WinTrust]::WTD_UI_NONE
+            $data.fdwRevocationChecks = [WinTrust]::WTD_REVOKE_NONE
+            $data.dwUnionChoice = [WinTrust]::WTD_CHOICE_FILE
+            $data.pFile = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf($fileInfo))
+            [System.Runtime.InteropServices.Marshal]::StructureToPtr($fileInfo, $data.pFile, $false)
+            $data.dwStateAction = [WinTrust]::WTD_STATEACTION_IGNORE
+            $data.hWVTStateData = [IntPtr]::Zero
+            $data.pwszURLReference = [IntPtr]::Zero
+            $data.dwProvFlags = 0
+            $data.dwUIContext = 0
+            
+            $actionId = New-Object Guid -ArgumentList @( [WinTrust]::GENERIC_VERIFY_V2, 0, 0, 0,0,0,0,0,0,0,0 )
+            
+            # Call WinVerifyTrust (matches Python's wintrust.WinVerifyTrust)
+            $result = [WinTrust]::WinVerifyTrust([IntPtr]::Zero, [ref]$actionId, [ref]$data)
+            
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($data.pFile)
+            
+            # If valid (0 = success), return "valid"
+            if ($result -eq 0) {
+                # Get signer info if available
+                $signerName = ''
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $clean -ErrorAction SilentlyContinue
+                    if ($sig.SignerCertificate) {
+                        $signerName = $sig.SignerCertificate.Subject -replace 'CN=','' -replace ',.*',''
+                    }
+                } catch {}
+                
+                return @{ 
+                    Status = 'valid'
+                    Color = '#FF27AE60'
+                    Detail = if ($signerName) { "Valid signature: $signerName" } else { 'Valid signature' }
+                }
+            } else {
+                # If WinVerifyTrust fails, check catalog signature (matches Python's self._check_catalog_signature)
+                if (Test-CatalogSignatureWin32 -FilePath $clean) {
+                    return @{ 
+                        Status = 'valid'
+                        Color = '#FF27AE60'
+                        Detail = 'Valid signature (Windows catalog)'
+                    }
+                }
+                return @{ 
+                    Status = 'unsigned'
+                    Color = '#FFF39C12'
+                    Detail = 'No valid signature found'
+                }
+            }
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($filePathPtr)
+        }
+    } catch {
+        # On any exception, try catalog signature as fallback (matches Python's exception handler)
+        if (Test-CatalogSignatureWin32 -FilePath $clean) {
+            return @{ 
+                Status = 'valid'
+                Color = '#FF27AE60'
+                Detail = 'Valid signature (Windows catalog - fallback)'
+            }
+        }
+        return @{ 
+            Status = 'unsigned'
+            Color = '#FFF39C12'
+            Detail = "Signature check failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+# ============================================================
 #  WINDOW WIRING
 # ============================================================
 $window.Add_MouseLeftButtonDown({
@@ -496,294 +950,6 @@ $script:psPatterns = [ordered]@{
 }
 
 # ============================================================
-#  ULTIMATE SIGNATURE CHECKER v2.0
-#  - Full Authenticode validation
-#  - Windows catalog signature verification
-#  - Embedded signature detection
-#  - Proper Unsigned vs UnknownError distinction
-#  - Special Windows file handling
-# ============================================================
-function Get-Signature {
-    param([string]$FilePath)
-
-    if ([string]::IsNullOrWhiteSpace($FilePath) -or $FilePath -in @('Unknown','N/A','<no path>','')) {
-        return @{ Status = 'N/A'; Color = '#FF555555'; Detail = '' }
-    }
-
-    # Clean path — strip quotes, arguments
-    $clean = $FilePath.Trim().Trim('"').Trim("'")
-    if ($clean -match '^([A-Za-z]:\\[^"*?<>|]+?\.[a-zA-Z0-9]{1,6})') {
-        $clean = $matches[1]
-    }
-
-    # Check if file exists
-    if (-not (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue)) {
-        return @{ 
-            Status = 'DELETED'
-            Color = '#FFCC3333'
-            Detail = "File not found on disk: $clean"
-        }
-    }
-
-    # SPECIAL HANDLING: Windows system files often use catalog signatures
-    $isWindowsFile = $clean -match '^C:\\Windows\\'
-    
-    try {
-        # First attempt: Standard Authenticode check
-        $sig = Get-AuthenticodeSignature -FilePath $clean -ErrorAction Stop
-        
-        $signerName = ''
-        $thumbprint = ''
-        if ($sig.SignerCertificate) {
-            $signerName = $sig.SignerCertificate.Subject -replace 'CN=','' -replace ',.*',''
-            $thumbprint = $sig.SignerCertificate.Thumbprint
-        }
-
-        # Detailed switch with proper status codes
-        switch ($sig.Status) {
-            'Valid' {
-                # File has valid Authenticode signature
-                $detail = "Publisher: $signerName | Thumbprint: $thumbprint"
-                if ($sig.IsOSBinary) { $detail += " | Windows Binary" }
-                return @{ 
-                    Status = 'Valid Signature'
-                    Color = '#FF27AE60'
-                    Detail = $detail
-                }
-            }
-            
-            'NotSigned' {
-                # File has no Authenticode signature - check catalog
-                if ($isWindowsFile) {
-                    # Windows files often use catalog signatures
-                    $catalogResult = Test-CatalogSignature -FilePath $clean
-                    if ($catalogResult.Valid) {
-                        return @{ 
-                            Status = 'Valid Signature (Catalog)'
-                            Color = '#FF27AE60'
-                            Detail = "Verified via Windows catalog: $($catalogResult.Catalog)"
-                        }
-                    }
-                }
-                
-                # Check for embedded signature manually
-                if (Test-EmbeddedSignature -FilePath $clean) {
-                    return @{ 
-                        Status = 'Valid Signature (Embedded)'
-                        Color = '#FF27AE60'
-                        Detail = "File contains embedded signature"
-                    }
-                }
-                
-                # Truly unsigned
-                return @{ 
-                    Status = 'Unsigned'
-                    Color = '#FFF39C12'
-                    Detail = 'No signature found'
-                }
-            }
-            
-            'HashMismatch' {
-                return @{ 
-                    Status = 'TAMPERED'
-                    Color = '#FFCC0000'
-                    Detail = 'Hash mismatch — file has been modified'
-                }
-            }
-            
-            'NotTrusted' {
-                return @{ 
-                    Status = 'Untrusted'
-                    Color = '#FFFFA040'
-                    Detail = "Certificate not trusted: $signerName | Chain may be broken"
-                }
-            }
-            
-            'UnknownError' {
-                # This could be catalog-signed or embedded
-                if ($isWindowsFile) {
-                    $catalogResult = Test-CatalogSignature -FilePath $clean
-                    if ($catalogResult.Valid) {
-                        return @{ 
-                            Status = 'Valid Signature (Catalog)'
-                            Color = '#FF27AE60'
-                            Detail = "Verified via Windows catalog: $($catalogResult.Catalog)"
-                        }
-                    }
-                }
-                
-                if (Test-EmbeddedSignature -FilePath $clean) {
-                    return @{ 
-                        Status = 'Valid Signature (Embedded)'
-                        Color = '#FF27AE60'
-                        Detail = "File contains embedded signature"
-                    }
-                }
-                
-                # Try alternative verification method
-                $altResult = Test-AlternateSignature -FilePath $clean
-                if ($altResult.Valid) {
-                    return @{ 
-                        Status = 'Valid Signature (Alternate)'
-                        Color = '#FF27AE60'
-                        Detail = $altResult.Detail
-                    }
-                }
-                
-                return @{ 
-                    Status = 'Unsigned'
-                    Color = '#FFF39C12'
-                    Detail = 'No valid signature found'
-                }
-            }
-            
-            'NotSupportedFileFormat' {
-                return @{ 
-                    Status = 'N/A'
-                    Color = '#FF555555'
-                    Detail = 'File format does not support signatures'
-                }
-            }
-            
-            default {
-                return @{ 
-                    Status = 'Unknown'
-                    Color = '#FF888888'
-                    Detail = "Signature status: $($sig.Status)"
-                }
-            }
-        }
-    } catch [System.Security.Cryptography.CryptographicException] {
-        # This often happens with catalog-signed files
-        if ($isWindowsFile) {
-            $catalogResult = Test-CatalogSignature -FilePath $clean
-            if ($catalogResult.Valid) {
-                return @{ 
-                    Status = 'Valid Signature (Catalog)'
-                    Color = '#FF27AE60'
-                    Detail = "Verified via Windows catalog: $($catalogResult.Catalog)"
-                }
-            }
-        }
-        return @{ 
-            Status = 'Unsigned'
-            Color = '#FFF39C12'
-            Detail = "File exists but no signature found"
-        }
-    } catch {
-        return @{ 
-            Status = 'Error'
-            Color = '#FF888888'
-            Detail = "Signature check failed: $($_.Exception.Message)"
-        }
-    }
-}
-
-# ============================================================
-#  HELPER: Test Windows Catalog Signature
-# ============================================================
-function Test-CatalogSignature {
-    param([string]$FilePath)
-    
-    $result = @{ Valid = $false; Catalog = '' }
-    
-    try {
-        # Use signtool if available (Windows SDK)
-        $tempFile = [System.IO.Path]::GetTempFileName()
-        $output = & signtool verify /pa /catalog "$FilePath" 2>&1 | Out-String
-        
-        if ($output -match 'Successfully verified') {
-            $result.Valid = $true
-            if ($output -match 'Catalog:\s*(.+)') {
-                $result.Catalog = $matches[1].Trim()
-            } else {
-                $result.Catalog = 'Windows Catalog'
-            }
-        }
-    } catch {
-        # Fallback: Check if file is in trusted Windows catalog via known good list
-        $fileName = Split-Path -Leaf $FilePath
-        $knownGood = @(
-            'ntdll.dll', 'kernel32.dll', 'user32.dll', 'advapi32.dll',
-            'ws2_32.dll', 'shell32.dll', 'ole32.dll', 'comctl32.dll',
-            'msvcrt.dll', 'gdi32.dll', 'wininet.dll', 'shlwapi.dll',
-            'psapi.dll', 'iphlpapi.dll', 'dnsapi.dll', 'crypt32.dll',
-            'wintrust.dll', 'imagehlp.dll', 'dbghelp.dll', 'version.dll'
-        )
-        
-        if ($knownGood -contains $fileName) {
-            $result.Valid = $true
-            $result.Catalog = 'Trusted Windows Component'
-        }
-    }
-    
-    return $result
-}
-
-# ============================================================
-#  HELPER: Test Embedded Signature (via file header)
-# ============================================================
-function Test-EmbeddedSignature {
-    param([string]$FilePath)
-    
-    try {
-        # Read the file header to check for certificate table
-        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-        
-        # Check for PE signature and certificate table
-        if ($bytes.Length -gt 0x80) {
-            # Look for PE signature at offset 0x3C
-            $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
-            
-            # Check if it's a PE file (has 'PE\0\0' signature)
-            if ($peOffset -gt 0 -and $bytes.Length -gt $peOffset + 4) {
-                $peSig = [System.Text.Encoding]::ASCII.GetString($bytes, $peOffset, 2)
-                if ($peSig -eq 'PE') {
-                    # Look for certificate table in optional header
-                    # This is complex - simplified check for now
-                    return $true  # Assume embedded signature exists for PE files
-                }
-            }
-        }
-    } catch {
-        # If we can't read the file, assume no embedded signature
-    }
-    
-    return $false
-}
-
-# ============================================================
-#  HELPER: Test Alternate Signature Methods (PowerShell, etc.)
-# ============================================================
-function Test-AlternateSignature {
-    param([string]$FilePath)
-    
-    $result = @{ Valid = $false; Detail = '' }
-    
-    # Check if it's a PowerShell script with signature block
-    if ($FilePath -match '\.ps1$|\.psm1$|\.psd1$') {
-        try {
-            $content = Get-Content -Path $FilePath -Raw -ErrorAction SilentlyContinue
-            if ($content -match '# SIG # Begin signature block') {
-                $result.Valid = $true
-                $result.Detail = 'PowerShell script with embedded signature'
-            }
-        } catch {}
-    }
-    
-    # Check for Authenticode even if Get-AuthenticodeSignature failed
-    try {
-        $sig = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction SilentlyContinue
-        if ($sig.Status -eq 'Valid') {
-            $result.Valid = $true
-            $result.Detail = 'Valid signature (direct check)'
-        }
-    } catch {}
-    
-    return $result
-}
-
-# ============================================================
 #  HELPERS
 # ============================================================
 function Get-AppIcon {
@@ -821,8 +987,9 @@ function Set-RiskFromScore {
         'Low'      = '#FF2ECC71'
         'Info'     = '#FF3498DB'
         'Defender' = '#FF9B59B6'
-        'DELETED'  = '#FFCC3333'
-        'TAMPERED' = '#FFCC0000'
+        'deleted'  = '#FFCC3333'
+        'unsigned' = '#FFF39C12'
+        'valid'    = '#FF27AE60'
     }
 
     $d['RiskLevel'] = $sev
@@ -911,8 +1078,10 @@ function Parse-AppCrash {
     }
     $d['SigStatus'] = $sig.Status; $d['SigColor'] = $sig.Color; $d['SigDetail'] = $sig.Detail
 
-    if ($sig.Status -eq 'DELETED')  { Set-RiskFromScore -d $d -score 0 -forceSev 'DELETED' }
-    if ($sig.Status -eq 'TAMPERED') { Set-RiskFromScore -d $d -score 99 }
+    if ($sig.Status -eq 'deleted')  { Set-RiskFromScore -d $d -score 0 -forceSev 'deleted' }
+    if ($sig.Status -eq 'unsigned' -and $d['RiskLevel'] -notin @('CRITICAL','High')) { 
+        # Keep existing risk, just note it's unsigned
+    }
 
     return $d
 }
@@ -1257,7 +1426,7 @@ function Load-Events {
             foreach ($ev in $evts) {
                 $d = Parse-AppCrash -msg $ev.Message -ev $ev
                 $null = $raw.Add((New-Item-Row -d $d))
-                if ($d['RiskLevel'] -in @('Medium','High','Danger','CRITICAL','DELETED','TAMPERED')) { $riskyCount++ }
+                if ($d['RiskLevel'] -in @('Medium','High','CRITICAL')) { $riskyCount++ }
                 if ($d['RiskLevel'] -eq 'CRITICAL') { $critCount++ }
             }
         } catch { }
