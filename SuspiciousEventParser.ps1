@@ -496,7 +496,7 @@ $script:psPatterns = [ordered]@{
 }
 
 # ============================================================
-#  ADVANCED SIGNATURE CHECK
+#  SIMPLE SIGNATURE CHECK (Matches Registry Parser)
 # ============================================================
 function Get-Signature {
     param([string]$FilePath)
@@ -511,64 +511,47 @@ function Get-Signature {
         $clean = $matches[1]
     }
 
-    # Must have a file extension
-    if ($clean -notmatch '\.[a-zA-Z0-9]{1,6}$') {
-        return @{ Status = 'N/A'; Color = '#FF555555'; Detail = '' }
-    }
-
-    # Not on disk
-    if (-not (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue)) {
-        return @{ Status = 'DELETED'; Color = '#FFCC3333'; Detail = "File not found on disk: $clean" }
+    # Check if file exists
+    $exists = Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue
+    
+    if (-not $exists) {
+        return @{ Status = 'File Was Not Found'; Color = '#FFCC3333'; Detail = "File not found on disk: $clean" }
     }
 
     try {
-        $sig = Get-AuthenticodeSignature -LiteralPath $clean -ErrorAction Stop
-
+        $sig = Get-AuthenticodeSignature -FilePath $clean -ErrorAction SilentlyContinue
+        
         $signerName = ''
         if ($sig.SignerCertificate) {
             $signerName = $sig.SignerCertificate.Subject -replace 'CN=','' -replace ',.*',''
         }
 
+        # Match exactly the registry parser's logic
         switch ($sig.Status) {
             'Valid' {
-                return @{ Status = "Signed: $signerName".TrimEnd(': ');
-                          Color  = '#FF27AE60'
-                          Detail = "Publisher: $signerName | Thumbprint: $($sig.SignerCertificate.Thumbprint)" }
+                return @{ Status = 'Valid Signature'; Color = '#FF27AE60'; Detail = "Publisher: $signerName" }
             }
             'NotSigned' {
-                return @{ Status = 'Unsigned'; Color = '#FFF39C12'
-                          Detail = 'No Authenticode signature found' }
+                return @{ Status = 'Invalid Signature (NotSigned)'; Color = '#FFF39C12'; Detail = 'No Authenticode signature found' }
             }
             'HashMismatch' {
-                return @{ Status = 'TAMPERED'; Color = '#FFCC0000'
-                          Detail = 'Hash mismatch — file may be modified/injected' }
+                return @{ Status = 'Invalid Signature (HashMismatch)'; Color = '#FFCC0000'; Detail = 'Hash mismatch — file may be modified' }
             }
             'NotTrusted' {
-                return @{ Status = 'Untrusted'; Color = '#FFFFA040'
-                          Detail = "Cert not in trusted root store. Signer: $signerName" }
+                return @{ Status = 'Invalid Signature (NotTrusted)'; Color = '#FFFFA040'; Detail = "Cert not trusted: $signerName" }
             }
             'UnknownError' {
-                # Try catalog signature fallback
-                try {
-                    $catResult = & wintrust.exe $clean 2>$null
-                    if ($LASTEXITCODE -eq 0) {
-                        return @{ Status = 'Catalog-OK'; Color = '#FF27AE60'; Detail = 'Verified via Windows catalog' }
-                    }
-                } catch {}
-                return @{ Status = 'Unsigned'; Color = '#FFF39C12'; Detail = 'Unknown signature error' }
-            }
-            'NotSupportedFileFormat' {
-                return @{ Status = 'N/A'; Color = '#FF555555'; Detail = 'File format does not support Authenticode' }
+                return @{ Status = 'Invalid Signature (UnknownError)'; Color = '#FF888888'; Detail = 'Signature verification error' }
             }
             default {
-                return @{ Status = $sig.Status; Color = '#FF888888'; Detail = "Status: $($sig.Status)" }
+                return @{ Status = 'Invalid Signature (UnknownError)'; Color = '#FF888888'; Detail = "Status: $($sig.Status)" }
             }
         }
     } catch {
         if (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue) {
-            return @{ Status = 'Unsigned'; Color = '#FFF39C12'; Detail = "Could not read signature: $($_.Exception.Message)" }
+            return @{ Status = 'Invalid Signature (UnknownError)'; Color = '#FF888888'; Detail = "Could not read signature: $($_.Exception.Message)" }
         }
-        return @{ Status = 'DELETED'; Color = '#FFCC3333'; Detail = "File not found: $clean" }
+        return @{ Status = 'File Was Not Found'; Color = '#FFCC3333'; Detail = "File not found: $clean" }
     }
 }
 
